@@ -20,7 +20,9 @@ package admission
 import (
 	"encoding/json"
 	"fmt"
+	"github.com/pkg/errors"
 	"io/ioutil"
+	"k8s.io/apimachinery/pkg/util/intstr"
 	"net/http"
 	"reflect"
 
@@ -38,8 +40,12 @@ const (
 	validatingWebhookConfiguration = "tapp-admission"
 )
 
-var validatePath = "/validate/tapp"
-var failPolicy admissionregistrationv1beta1.FailurePolicyType = "Fail"
+
+var (
+	validatePath = "/validate/tapp"
+	failPolicy admissionregistrationv1beta1.FailurePolicyType = "Fail"
+)
+
 
 // Register registers the validatingWebhookConfiguration to kube-apiserver
 // Note: always return err as nil, it will be used by wait.PollUntil().
@@ -142,12 +148,44 @@ func admitTApp(ar *admissionv1beta1.AdmissionReview) *admissionv1beta1.Admission
 	reviewResponse := &admissionv1beta1.AdmissionResponse{}
 	reviewResponse.Allowed = true
 
-	var tapp tappv1.TApp
-	raw := ar.Request.Object.Raw
-	if err := json.Unmarshal(raw, &tapp); err != nil {
-		klog.Errorf("Failed to unmarshal tapp from %s: %v", raw, err)
+	tapp, err := tryUnmarshal(ar.Request.Object.Raw)
+	if err != nil {
+		klog.Errorf("Failed to unmarshal tapp from %s: %v", ar.Request.Object.Raw, err)
+		return ToAdmissionResponse(err)
+	}
+
+	err = verifyUpdateStrategy(tapp)
+	if err != nil {
+		klog.Errorf("Failed to verify update strategy: %v", err)
 		return ToAdmissionResponse(err)
 	}
 
 	return reviewResponse
+}
+
+func tryUnmarshal(raw []byte) (*tappv1.TApp, error) {
+	var tapp *tappv1.TApp
+	if err := json.Unmarshal(raw, tapp); err != nil {
+		return nil, errors.Wrapf(ErrUnmarshal, "failed to unmarshal raw bytes %v", err)
+	}
+	return tapp, nil
+}
+
+func verifyUpdateStrategy(tapp *tappv1.TApp) error {
+	max, err := intstr.GetValueFromIntOrPercent(tapp.Spec.UpdateStrategy.MaxUnavailable, int(tapp.Spec.Replicas), true)
+	if err != nil {
+		return err
+	}
+	if max <= 0 {
+		return errors.Wrapf(ErrInvalidParam, "update strategy MaxUnavailable not valid: %d", max)
+	}
+
+	max, err = intstr.GetValueFromIntOrPercent(tapp.Spec.UpdateStrategy.ForceUpdate.MaxUnavailable, int(tapp.Spec.Replicas), true)
+	if err != nil {
+		return err
+	}
+	if max <= 0 {
+		return errors.Wrapf(ErrInvalidParam, "force update strategy MaxUnavailable not valid: %d", max)
+	}
+	return nil
 }
